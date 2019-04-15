@@ -1,6 +1,6 @@
 
 
-##SD Card Bootloader for MSP430
+## SD Card Bootloader for MSP430
 
 Presented here is a very small bootloader which can be used to update firmware in the field from an SD or microSD card containing the update file.  The bootloader uses 1K at the beginning of Main memory.  This option is an alternative to other update methods requiring interface devices and cables/jumpers, and appropriate software and drivers.
 
