@@ -1,0 +1,574 @@
+; This is an SD card MAIN-memory bootloader for the MSP430G2452's
+; USI module.  It is flashed to the G2452 at the beginning of
+; MAIN memory, and occupies 1KB. It works with SD and SDHC cards
+; formatted as FAT16 or FAT32, with 16K or 32K clusters.  There is
+; an associated Windows file that converts a normal Intel Hex or
+; TI-Txt file into the binary format needed by the bootloader,
+; and an associated PDF file with instructions.
+;
+; This code is written for the Naken Assembler.
+
+.msp430
+.include "msp430g2452.inc"
+
+MAIN		equ	0xE000			;for G2452
+NEWMAIN 	equ	(MAIN + 0x400)		;beginning of segment afer bootloader
+RAMTOP		equ	0x0300			;for G2452 - for setting stack pointer
+DCO		equ	CALDCO_1MHZ		;settings for 1MHz
+BCS		equ	CALBC1_1MHZ
+FLASHDIV	equ	2			;divisor for Flash erase/write clock
+CSDELAY 	equ	14			;delay when changing Card Select state
+BOOTDELAY	equ	0xA23C			;250ms delay to allow SD to boot
+CSIN		equ	P1IN			;Card Select port & pin
+CSPIN		equ	BIT4			;  P1.4, but could be anything except SPI pins
+CONTROL0	equ	USICTL0			;USI registers
+CONTROL1	equ	USICTL1
+CLKCTL		equ	USICKCTL
+COUNT		equ	USICNT
+SHIFTREG	equ	USISRL
+RXFLAG		equ	USIIFG
+
+;This should be the end of items that need to be changed for other USI chips/designs
+
+CSOUT		equ	(CSIN+1)		;Card Select line output register
+CSDIR		equ	(CSIN+2)                ;Card Select line direction register
+CMD17		equ	0x51			;command to read file sector
+CMD18		equ	0x52			;   read multiple sectors
+SEGMENT 	equ	0x200			;MSP430 erase segment size
+
+PARTLBA 	equ	0x8			;MBR - LBA of first partition
+
+BYTESPERSECTOR	equ	0x0B			;partition boot sector items
+SECTORSPERCLUS	equ	0x0D
+RESERVEDBLOCKS	equ	0x0E
+SECTORSPERFAT	equ	0x16
+SECTPERFAT32	equ	0x24
+ROOTCLUSTER	equ	0x2C			;FAT32 - cluster of root directory
+
+ATTRIBUTES	equ	0x0B			;root directory entry items
+CLUSTERLO 	equ	0x1A
+CLUSTERHI	equ	0x14
+SIZELO		equ	0x1C
+SIZEHI		equ	0x1E
+						;RAM usage
+RAM		equ	0x0200			;two root directory entries
+DELAYCOUNT	equ	0x0240			;counter for delay function
+CLUSTERSECTORS	equ	0x0242			;sectors per cluster
+CMDBYTE 	equ	0x0243			;begin command string to read file
+ADDRESSHI	equ	0x0244			;address to begin read
+ADDRESSLO	equ	0x0246
+CRC		equ	0x0248			;ending CRC value - usually FF
+BATCH		equ	0x0249			;how much of sector to read
+DUMP		equ	0x024A			;how much to dump before BATCH
+SECTORSIZE	equ	0x024C			;number of bytes per sector
+SDHC		equ	0x024E			;flag for SDHC
+FAT32		equ	0x024F			;flag for FAT32
+BYTECOUNT	equ	0x0250
+						;Registers used
+rIN		equ	R4			;incoming byte
+rOUT		equ	R5			;outgoing byte
+rSECTORBYTE	equ	R6			;pointer into disk sector
+rVALID		equ	R7			;address of current selected file
+rCANDIDATE	equ	R8			;address of potential file
+rENTRYBYTE	equ	R9			;counter for directory entry
+rFLASHPOINTER	equ	R10			;pointer to next location in MAIN
+rXORSUM 	equ	R11			;cumulative XOR sum for file data
+rTEMP		equ	R12			;working value
+rCMDSTRING	equ	R13			;pointer to init command
+rWORKINGLO	equ	R14			;counter for batch
+rWORKINGHI	equ	R15			;counter for flash segment
+
+.org		MAIN				;this code assembles to this address
+
+PowerUp:
+
+	bit.b	#CSPIN, 	&CSIN		;read state of CD(DAT3) pin of SD card
+						;   1Meg external pulldown resistor required
+	jnz	BootLoader			;SD's internal pullup is 50K on this pin
+	br	#NEWMAIN			;if no SD card, jump to application
+
+BootLoader:
+
+	mov.w	#WDTPW+WDTHOLD, &WDTCTL 	;disable Watchdog timer
+	mov.w	#RAMTOP,	SP		;set stack pointer to top of RAM
+
+;Set main clock to 1MHz
+
+	mov.b	&DCO,		&DCOCTL 	;Set clock to calibrated 1MHz values
+	mov.b	&BCS,		&BCSCTL1
+
+	mov.w	#BOOTDELAY,	&DELAYCOUNT	;250ms at 1MHz default clock on boot
+	call	#Delay1				;allow time for SD to boot
+
+	mov.w	#FWKEY+FSSEL_1+FLASHDIV, &FCTL2 ;MCLK, Flash clock = 333KHz at 1 Mhz
+
+	mov.b	#CSPIN, 	&CSOUT		;Card Select Pin = high (deselect)
+	mov.b	#CSPIN, 	&CSDIR		;Port direction = output
+
+;Initialize USI port for SPI
+
+	mov.b	#USIPE7+USIPE6+USIPE5+USIMST+USIOE+USISWRST, &CONTROL0	;master, MSB
+
+	mov.b	#USICKPH,	&CONTROL1	;phase=1
+
+	mov.b	#USIDIV_2+USISSEL_3,  &CLKCTL	;pol=0, divide SMCLK by 4 (250KHz)
+						;CLKCTL -> 8-bit
+
+	bic.b	#USISWRST,	&CONTROL0	;enable USI
+
+	mov.b	#0xFF,		&SHIFTREG	;fix for errata USI5
+	mov.b	#7,		&COUNT
+
+	mov.b	#8,		rSECTORBYTE     ;send more clocks with CS high
+	call	#DumpRest
+
+	mov.b	#0xFF,		&CRC		;CRC must be sent, but is not checked
+
+;Initialize SD Card - must be SD/SDHC or microSD/SDHC
+
+DoCMD0: 					;initialization is a series of commands
+
+	mov.w	#CMD0,		rCMDSTRING
+	call	#SendCommand
+	cmp.b	#01,		rIN		;should return 01
+	jnz	DoCMD0
+
+DoCMD8:
+
+	mov.w	#CMD8,		rCMDSTRING
+	call	#SendCommand
+	mov.w	#CMD41SC,	rWORKINGLO
+	cmp.b	#05,		rIN		;illegal command
+	jz	DoCMD55
+	cmp.b	#01,		rIN		;should return 01
+	jnz	DoCMD8
+
+Echo:
+
+	call	#GetByte			;will echo 4 command bytes. AA = last
+	cmp.b	#0xAA,		rIN		;(see command sequence of CMD8 below)
+	jnz	Echo
+
+	mov.w	#CMD41HC,	rWORKINGLO
+
+DoCMD55:
+
+	mov.w	#CMD55, 	rCMDSTRING
+	call	#SendCommand
+	cmp.b	#05,		rIN
+	jz	ErrorOut
+
+	mov.w	rWORKINGLO, 	rCMDSTRING
+	call	#SendCommand
+	cmp.b	#01,		rIN		;try again
+	jz	DoCMD55
+
+DoCMD58:
+
+	mov.w	#CMD58,		rCMDSTRING	;determine SD or SDHC
+	call	#SendCommand
+	cmp.b	#00,		rIN
+	jnz	DoCMD58
+
+	call	#GetByte
+	mov.b	rIN,		&SDHC
+	call	#TM1
+	bit.b	#0x80,		&SDHC
+	jz	DoCMD58
+	and.w	#0x40,		&SDHC		;this also sets FAT32 flag to zero
+	jnz	SetupRead
+
+DoCMD16:					;set transfer block size to 512 bytes
+
+	mov.w	#CMD16, 	rCMDSTRING
+	call	#SendCommand
+
+	cmp.b	#00,		rIN
+	jnz	ErrorOut
+
+SetupRead:
+
+	mov.w	#00,		&ADDRESSHI	;set address to beginning of drive
+	mov.w	#00,		&ADDRESSLO
+	mov.w	#0x200, 	&SECTORSIZE
+
+ReadMBR:
+
+	mov.w	#0x01BE,	&DUMP		;no room for entire block
+	call	#ReadSector			;dump, then batch, then dump
+
+	mov.w	&RAM+PARTLBA,	rWORKINGLO	;sector of first partition
+	mov.w	&RAM+PARTLBA+2, rWORKINGHI
+	call	#Multiply			;convert LBA to bytes if SD, add to address
+
+ReadBoot:
+
+	mov.w	#0,		&DUMP		;read beginning of 1st partition
+	call	#ReadSector
+
+	mov.b	&RAM+BYTESPERSECTOR,	&SECTORSIZE	;save sector size
+	mov.b	&RAM+BYTESPERSECTOR+1,	&SECTORSIZE+1
+	mov.b	&RAM+SECTORSPERCLUS,	&CLUSTERSECTORS ;and cluster size
+
+	mov.w	&RAM+SECTORSPERFAT,	rWORKINGLO	;calculate where root dir begins
+	cmp.w	#0,			rWORKINGLO	;always zero in FAT32
+	jnz	FillHi                                  ;non-zero if FAT16
+	bis.b	#BIT0,			&FAT32		;set FAT32 flag
+	mov.w	&RAM+SECTPERFAT32,	rWORKINGLO      ;  and get value from this location
+
+FillHi:
+
+	mov.w	#0,			rWORKINGHI	;skip over FATs
+
+	rla.w	rWORKINGLO				;assume 2 FAT copies
+	rlc.w	rWORKINGHI
+
+	add.w	&RAM+RESERVEDBLOCKS,	rWORKINGLO	;also skip reserved sectors
+	adc.w	rWORKINGHI
+
+	call	#Multiply				;convert to bytes if SD, add to address
+
+	bit.b	#BIT0,			&FAT32
+	jz	OpenRoot
+
+	mov.w	&RAM+ROOTCLUSTER,	rWORKINGLO
+	mov.w	&RAM+ROOTCLUSTER +2,	rWORKINGHI
+	mov.w	&RAM+SECTPERFAT32,	rTEMP
+	call	#Cluster2Sectors
+
+OpenRoot:
+
+	call	#ReadMulti			;open root directory sector
+
+	mov.w	#RAM,		rVALID		;looking for file with highest
+	mov.w	#0,		0(rVALID)	;   value in first 3 bytes, and
+	mov.w	#0,		2(rVALID)	;   which is the right size
+	mov.w	#RAM+0x20,	rCANDIDATE	;start reading directory entries to here
+
+ResetEntry:
+
+	mov.w	#0x20,		rENTRYBYTE	;read one directory entry = 32 bytes
+
+ReadByte:
+
+	call	#ReceiveByte
+	mov.b	rIN,		0(rCANDIDATE)
+	inc.w	rCANDIDATE
+	dec.w	rENTRYBYTE
+	jnz	ReadByte
+	sub.w	#0x20,		rCANDIDATE	;restore address
+
+	cmp.w	#0,		0(rCANDIDATE)	;first byte = 0: means end of directory
+	jz	EndOfDir
+	cmp.w	#0xE5,		0(rCANDIDATE)	;skip deleted entry
+	jz	ResetEntry
+	bit.b	#0x1E,		ATTRIBUTES(rCANDIDATE)	;skip LFN, volume label,
+	jnz	ResetEntry				;  hidden, subdir
+
+	cmp.w	#0,		SIZEHI(rCANDIDATE)	;skip if file size wrong
+	jnz	ResetEntry
+	cmp.w	#(0xFFFF-NEWMAIN),   SIZELO(rCANDIDATE) ;should be rest of MAIN-1
+	jnz	ResetEntry
+
+	cmp.b	2(rVALID),	2(rCANDIDATE)	;size ok, now check 1st three chars
+	mov.b	1(rCANDIDATE),	rTEMP		;basically one round of a bubble sort
+	subc.b	1(rVALID),	rTEMP           ;    move biggest (valid) to the top
+	mov.b	0(rCANDIDATE),	rTEMP
+	subc.b	0(rVALID),	rTEMP
+	jnc	ResetEntry			;1st 3 chars of candidate less than valid
+
+	xor.w	#0x20,		rCANDIDATE	;candidate is greater, so make it valid
+	xor.w	#0x20,		rVALID
+	jmp	ResetEntry
+
+EndOfDir:
+
+	call	#TerminateMulti			;terminate multi-sector read
+
+	cmp.b	#0,		0(rVALID)	;if 1st char of valid still 0,
+	jz	ErrorOut			;  no file found of right size
+	mov.w	CLUSTERLO(rVALID),rWORKINGLO	;entry shows cluster where file begins
+	mov.w	#0,		  rWORKINGHI
+	bit.b	#BIT0,		&FAT32				;if FAT32, still non-zero
+	jz	Normalize
+	mov.w	CLUSTERHI(rVALID),rWORKINGHI    ;32-bit value in FAT32
+
+Normalize:
+
+	mov.b	&CLUSTERSECTORS, rTEMP
+	call	#Cluster2Sectors
+
+	bit.b	#BIT0,		&FAT32
+	jnz	GoMul
+	mov.w	#0x20,		rWORKINGLO	;add root directory size if FAT16
+	mov.w	#0,		rWORKINGHI
+	call	#Multiply
+
+GoMul:
+
+	mov.b	#USISSEL_3,	&CLKCTL		;shift to faster SPI clock.  Div = 1
+	call	#ReadMulti			;finally - open file contents
+	mov.w	#NEWMAIN,	rFLASHPOINTER	;  and set up to read in & write to flash
+	mov.w	#0,		rXORSUM
+	mov.w	#FWKEY, 	&FCTL3		;Unlock flash
+
+EraseSegment:
+
+	mov.w	#SEGMENT,	&BYTECOUNT	;erase one segment at a time
+	mov.w	#FWKEY+ERASE,	&FCTL1		;enable Erase mode
+	clr.b	0(rFLASHPOINTER)		;dummy write to start erase
+	mov.w	#FWKEY+WRT,	&FCTL1		;switch from Erase to Write
+
+WriteByte:
+
+	call	#ReceiveByte			;read in bytes, write to flash
+	xor.b	rIN,		rXORSUM
+	mov.b	rIN,		0(rFLASHPOINTER)
+	inc.w	rFLASHPOINTER
+	cmp.w	#0xFFFE,	rFLASHPOINTER	;stop at 0xFFFE
+	jz	Close
+	dec	&BYTECOUNT
+	jnz	WriteByte
+	jmp	EraseSegment
+
+Close:
+
+	mov.w	#MAIN,		&0xFFFE 	;RESET vector points to bootloader
+	mov.w	#FWKEY, 	&FCTL1		;Turn off Write
+	mov.w	#FWKEY+LOCK,	&FCTL3		;Relock flash
+	call	#ReceiveByte			;read last byte from file
+	xor.b	rIN,		rXORSUM 	;if match, XORSUM = 0
+	call	#TerminateMulti 		;end SD command
+	cmp.b	#0,		rXORSUM
+	jnz	ErrorOut
+
+GoodOut:
+
+	bis.b	#CSPIN, 	&CSOUT		;see pdf for LED setup on CSPIN
+
+ErrorOut:
+
+	bis.w	#CPUOFF+OSCOFF,	SR		;Shut down processor. remove card,
+						;   then reboot
+
+
+CMD0:	.db	0x40,0,0,0,0,0x95		;intialization commands
+CMD8:	.db	0x48,0,0,1,0xAA,0x87
+CMD16:	.db	0x50,0,0,2,0,0x15
+CMD55:	.db	0x77,0,0,0,0,0x65
+CMD41SC:.db	0x69,0,0,0,0,0xE5
+CMD41HC:.db	0x69,0x40,0,0,0,0x77
+CMD12:	.db	0x4C,0,0,0,0,0x61
+CMD58:	.db	0x7A,0,0,0,0,0xFD
+
+
+TerminateMulti: 				;terminate multi-sector read
+
+	mov.w	#CMD12, 	rCMDSTRING
+	call	#SendCommand
+
+TM1:
+
+	call	#InByte 			;dump any garbage, wait for FF
+	call	#InByte
+	jmp	InByte
+
+Cluster2Sectors:
+
+	sub.w	#2,		rWORKINGLO      ;first cluster is cluster 2, not zero
+	sbc.w	rWORKINGHI
+	rra.w	rTEMP
+
+ClusterLoop:
+
+	rla.w	rWORKINGLO			;convert cluster to sectors
+	rlc.w	rWORKINGHI
+	rra.w	rTEMP
+	jnz	ClusterLoop
+
+Multiply:					;convert sectors to bytes,
+						;   and add to address
+
+	bit.b	#0xFF,		&SDHC		;if SD, convert sector address to bytes
+	jnz	MulEnd
+	push.w	&SECTORSIZE			;always a power of 2
+	rra.w	&SECTORSIZE
+
+MulLoop:
+
+	rla.w	rWORKINGLO
+	rlc.w	rWORKINGHI
+	rra.w	&SECTORSIZE
+	jnz	MulLoop
+	pop.w	&SECTORSIZE
+
+MulEnd:
+
+	add.w	rWORKINGLO,	&ADDRESSLO
+	addc.w	rWORKINGHI,	&ADDRESSHI
+	ret
+
+ReadMulti:					;initiate a multi-block read
+
+	mov.b	#CMD18, 	&CMDBYTE
+
+RM2:
+
+	mov.w	#CMDBYTE,	rCMDSTRING	;command string is in RAM
+	call	#SendReadCommand
+	cmp.b	#00,		rIN
+	jnz	RM2
+	jmp	GetFE				;0xFE comes just before data
+
+ReadSector:					;open single sector for reading
+
+	mov.b	#0x40,		&BATCH		;want this middle portion
+
+RS2:
+
+	mov.b	#CMD17, 	&CMDBYTE	;open sector, wait for FE
+	mov.w	#CMDBYTE,	rCMDSTRING
+	call	#SendReadCommand
+	cmp.b	#00,		rIN
+	jnz	RS2
+	call	#GetFE
+
+DumpFirst:
+						;dump beginning bytes
+	cmp.w	#0,		&DUMP
+	jz	GetMiddle
+	call	#GetByte
+	dec.w	rSECTORBYTE
+	dec.w	&DUMP
+	jnz	DumpFirst
+
+GetMiddle:
+
+	mov.w	#RAM,		rENTRYBYTE	;read in middle BATCH bytes
+
+GM1:
+
+	call	#GetByte
+	dec.w	rSECTORBYTE
+	mov.b	rIN,		0(rENTRYBYTE)
+	inc.w	rENTRYBYTE
+	dec.b	&BATCH
+	jnz	GM1
+
+DumpRest:					;dump rest of sector
+
+	call	#GetByte
+	dec.w	rSECTORBYTE
+	jnz	DumpRest
+	call	#GetByte			;CRC
+	call	#GetByte
+	ret
+
+GetFE:
+
+	call	#GetByte
+	cmp.b	#0xFE,		rIN		;marker for beginning of data
+	jnz	GetFE
+	mov.w	#0x200, 	rSECTORBYTE	;keep track of position within sector
+	ret
+
+SendReadCommand:
+
+	swpb	&ADDRESSLO			;must send MSB first.  words are right,
+	swpb	&ADDRESSHI			;   but bytes are not
+	call	#SendCommand
+	swpb	&ADDRESSLO
+	swpb	&ADDRESSHI
+	ret
+
+SendCommand:					;Send CMD and wait for non-FF response
+
+	mov.w	#6,		rTEMP
+
+TestBusy:
+
+	call	#GetByte			;8 clocks to finish previous command
+	bis.b	#CSPIN, 	&CSOUT		;Toggle CS off, then back on
+	call	#Delay
+	bic.b	#CSPIN, 	&CSOUT		;CS on
+	call	#Delay				;delay after CS
+
+NextByte:
+
+	mov.b	@rCMDSTRING+,	rOUT		;dump bytes rec'd when sending command
+	call	#OutByte
+	call	#InWait
+	dec.w	rTEMP
+	jnz	NextByte
+
+InByte: 					;get first non-FF response (try 10 times)
+
+	mov.w	#11,		rTEMP
+
+InLoop:
+
+	dec.w	rTEMP
+	jz	GoRet
+	call	#GetByte
+	cmp.b	#0xFF,		rIN
+	jz	InLoop
+
+GoRet:
+
+	ret
+
+FFOut:
+
+	mov.b	#0xFF,		rOUT
+
+OutByte:
+
+	bit.b	#RXFLAG,	&CONTROL1	;is last shift completed?
+	jz	OutByte 			;no
+	mov.b	rOUT,		&SHIFTREG	;yes, send byte
+	mov.b	#8,		&COUNT
+	ret
+
+GetByte:
+						;must send to receive
+	call	#FFOut
+
+InWait:
+
+	bit.b	#RXFLAG,	&CONTROL1	;byte received?
+	jz	InWait				;no
+	mov.b	&SHIFTREG, 	rIN		;yes, store byte
+	ret
+
+ReceiveByte:					;next byte of multi-sector read
+
+	call	#GetByte
+	dec.w	rSECTORBYTE
+	jz	NextSector			;if sector finished, go to next one
+	ret
+
+NextSector:
+
+	push.w	rIN				;dump CRC from previous sector
+	call	#GetByte
+	call	#GetByte
+	call	#GetFE				;look for FE
+	pop.w	rIN
+	ret
+
+Delay:
+	mov.w	#CSDELAY,	&DELAYCOUNT	;delay function
+
+Delay1:
+
+	dec.w	&DELAYCOUNT
+	jnz	Delay1
+	ret
+
+.org	NEWMAIN
+
+	bis.w	#CPUOFF+OSCOFF,	SR		;Place holder for application
+
+
+.org	RESET_VECTOR
+.dw	PowerUp
