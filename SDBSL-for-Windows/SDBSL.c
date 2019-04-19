@@ -126,7 +126,7 @@ int main(int argc,char *argv[])
 	unsigned int currentAddr = NewMain;
 	unsigned int netAddr = 0;
 	unsigned char strdata[128];
-	unsigned char xorsum = 0;
+	unsigned char xorsum = 8;				//originally zero.  this seed is better.
 	unsigned int resetAdr = 0;
 	unsigned char temp = 0;
 	unsigned char temp1 = 0;
