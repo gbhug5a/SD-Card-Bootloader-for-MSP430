@@ -1,6 +1,6 @@
 ### Note:
 
-On April 19, 2019, the XOR checksum used to test for errors in the file read from the SD card was modified.  Anything downloaded before that date, as well as any binary files prepared by SDBSL.exe, should be updated to the new versions.  The modification was to change the initial XOR seed from zero to 8.  The zero seed would allow a file consisting of all zeros to be interpreted as valid, which could happen if an error caused reading from SD card sectors which had been fully erased to zeroes.
+On April 19, 2019, the XOR checksum used to test for errors in the file read from the SD card was modified.  Anything downloaded before that date, as well as any binary files prepared by SDBSL.exe, should be updated to the new versions.  The modification was to change the initial XOR seed from zero to 8.  The zero seed would allow a file consisting of all zeroes to be interpreted as valid, which could happen if an error caused reading from SD card sectors which had been fully erased to zeroes.
 
 
 ## SD Card Bootloader for MSP430
