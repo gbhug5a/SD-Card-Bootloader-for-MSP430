@@ -273,8 +273,8 @@ ReadByte:
 	cmp.b	2(rVALID),	2(rCANDIDATE)	;size ok, now check 1st three chars
 	mov.b	1(rCANDIDATE),	rTEMP		;basically one round of a bubble sort
 	subc.b	1(rVALID),	rTEMP           ;    move biggest (valid) to the top
-	mov.b	0(rCANDIDATE),	rTEMP
-	subc.b	0(rVALID),	rTEMP
+	mov.b	@rCANDIDATE,	rTEMP
+	subc.b	@rVALID,	rTEMP
 	jnc	ResetEntry			;1st 3 chars of candidate less than valid
 
 	xor.w	#0x20,		rCANDIDATE	;candidate is greater, so make it valid
@@ -309,14 +309,14 @@ GoMul:
 	mov.b	#USISSEL_3,	&CLKCTL		;shift to faster SPI clock.  Div = 1
 	call	#ReadMulti			;finally - open file contents
 	mov.w	#NEWMAIN,	rFLASHPOINTER	;  and set up to read in & write to flash
-	mov.w	#0,		rXORSUM
+	mov.b	#8,		rXORSUM		;intialize xor checksum
 	mov.w	#FWKEY, 	&FCTL3		;Unlock flash
 
 EraseSegment:
 
 	mov.w	#SEGMENT,	&BYTECOUNT	;erase one segment at a time
 	mov.w	#FWKEY+ERASE,	&FCTL1		;enable Erase mode
-	clr.b	0(rFLASHPOINTER)		;dummy write to start erase
+	clr.b	@rFLASHPOINTER			;dummy write to start erase
 	mov.w	#FWKEY+WRT,	&FCTL1		;switch from Erase to Write
 
 WriteByte:
@@ -337,9 +337,9 @@ Close:
 	mov.w	#FWKEY, 	&FCTL1		;Turn off Write
 	mov.w	#FWKEY+LOCK,	&FCTL3		;Relock flash
 	call	#ReceiveByte			;read last byte from file
-	xor.b	rIN,		rXORSUM 	;if match, XORSUM = 0
+	xor.b	rIN,		rXORSUM		;if XORSUM matches, will be zero
 	call	#TerminateMulti 		;end SD command
-	cmp.b	#0,		rXORSUM
+	cmp.b	#0,		rXORSUM         ;should be equal
 	jnz	ErrorOut
 
 GoodOut:
