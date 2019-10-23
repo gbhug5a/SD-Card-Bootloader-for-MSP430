@@ -1,3 +1,5 @@
+; Version 2
+
 ; This is an SD card MAIN-memory bootloader for the MSP430G2452's
 ; USI module.  It is flashed to the G2452 at the beginning of
 ; MAIN memory, and occupies 1KB. It works with SD and SDHC cards
@@ -11,6 +13,11 @@
 .msp430
 .include "msp430g2452.inc"
 
+CSPORT		equ	P1IN			;Card Select port & pin
+CSPIN		equ	BIT4			;  P1.4, but could be anything except SPI pins
+LEDPORT		equ	P1IN			;LED port & pin
+LEDPIN		equ	BIT3			;  P1.3, but could be anything except SPI pins
+
 MAIN		equ	0xE000			;for G2452
 NEWMAIN 	equ	(MAIN + 0x400)		;beginning of segment afer bootloader
 RAMTOP		equ	0x0300			;for G2452 - for setting stack pointer
@@ -19,8 +26,6 @@ BCS		equ	CALBC1_1MHZ
 FLASHDIV	equ	2			;divisor for Flash erase/write clock
 CSDELAY 	equ	14			;delay when changing Card Select state
 BOOTDELAY	equ	0xA23C			;250ms delay to allow SD to boot
-CSIN		equ	P1IN			;Card Select port & pin
-CSPIN		equ	BIT4			;  P1.4, but could be anything except SPI pins
 CONTROL0	equ	USICTL0			;USI registers
 CONTROL1	equ	USICTL1
 CLKCTL		equ	USICKCTL
@@ -30,8 +35,12 @@ RXFLAG		equ	USIIFG
 
 ;This should be the end of items that need to be changed for other USI chips/designs
 
-CSOUT		equ	(CSIN+1)		;Card Select line output register
-CSDIR		equ	(CSIN+2)                ;Card Select line direction register
+CSIN		equ	CSPORT
+CSOUT		equ	(CSPORT+1)
+CSDIR		equ	(CSPORT+2)
+LEDOUT		equ	(LEDPORT+1)
+LEDDIR		equ	(LEDPORT+2)
+
 CMD17		equ	0x51			;command to read file sector
 CMD18		equ	0x52			;   read multiple sectors
 SEGMENT 	equ	0x200			;MSP430 erase segment size
@@ -83,12 +92,14 @@ rWORKINGHI	equ	R15			;counter for flash segment
 PowerUp:
 
 	bit.b	#CSPIN, 	&CSIN		;read state of CD(DAT3) pin of SD card
-						;   1Meg external pulldown resistor required
-	jnz	BootLoader			;SD's internal pullup is 50K on this pin
-	br	#NEWMAIN			;if no SD card, jump to application
+						;  which is also the CS pin in SPI
+       						;  1Meg external pulldown resistor required
+						;  SD's internal pullup is 50K on this pin
+	jz	NEWMAIN				;if no SD card, jump to application
 
 BootLoader:
 
+	dint					;disable interrupts
 	mov.w	#WDTPW+WDTHOLD, &WDTCTL 	;disable Watchdog timer
 	mov.w	#RAMTOP,	SP		;set stack pointer to top of RAM
 
@@ -97,13 +108,14 @@ BootLoader:
 	mov.b	&DCO,		&DCOCTL 	;Set clock to calibrated 1MHz values
 	mov.b	&BCS,		&BCSCTL1
 
-	mov.w	#BOOTDELAY,	&DELAYCOUNT	;250ms at 1MHz default clock on boot
+	mov.w	#BOOTDELAY,	&DELAYCOUNT	;250ms at 1MHz clock
 	call	#Delay1				;allow time for SD to boot
 
 	mov.w	#FWKEY+FSSEL_1+FLASHDIV, &FCTL2 ;MCLK, Flash clock = 333KHz at 1 Mhz
 
-	mov.b	#CSPIN, 	&CSOUT		;Card Select Pin = high (deselect)
-	mov.b	#CSPIN, 	&CSDIR		;Port direction = output
+	mov.b	#0,		&P2SEL		;P2.6 and P2.7 to I/O
+	bis.b	#CSPIN,		&CSOUT		;CS Pin = output high (deselect card)
+	bis.b	#CSPIN, 	&CSDIR		;Port direction - CS = output
 
 ;Initialize USI port for SPI
 
@@ -119,7 +131,7 @@ BootLoader:
 	mov.b	#0xFF,		&SHIFTREG	;fix for errata USI5
 	mov.b	#7,		&COUNT
 
-	mov.b	#8,		rSECTORBYTE     ;send more clocks with CS high
+	mov.b	#8,		rSECTORBYTE     ;generate 80 clocks with CS high
 	call	#DumpRest
 
 	mov.b	#0xFF,		&CRC		;CRC must be sent, but is not checked
@@ -241,8 +253,8 @@ OpenRoot:
 	call	#ReadMulti			;open root directory sector
 
 	mov.w	#RAM,		rVALID		;looking for file with highest
-	mov.w	#0,		0(rVALID)	;   value in first 3 bytes, and
-	mov.w	#0,		2(rVALID)	;   which is the right size
+	mov.w	#0,		0(rVALID)	;   value in first 4 bytes, and
+						;   which is the right size
 	mov.w	#RAM+0x20,	rCANDIDATE	;start reading directory entries to here
 
 ResetEntry:
@@ -258,9 +270,9 @@ ReadByte:
 	jnz	ReadByte
 	sub.w	#0x20,		rCANDIDATE	;restore address
 
-	cmp.w	#0,		0(rCANDIDATE)	;first byte = 0: means end of directory
+	cmp.b	#0,		0(rCANDIDATE)	;first byte = 0: means end of directory
 	jz	EndOfDir
-	cmp.w	#0xE5,		0(rCANDIDATE)	;skip deleted entry
+	cmp.b	#0xE5,		0(rCANDIDATE)	;skip deleted entry
 	jz	ResetEntry
 	bit.b	#0x1E,		ATTRIBUTES(rCANDIDATE)	;skip LFN, volume label,
 	jnz	ResetEntry				;  hidden, subdir
@@ -270,14 +282,15 @@ ReadByte:
 	cmp.w	#(0xFFFF-NEWMAIN),   SIZELO(rCANDIDATE) ;should be rest of MAIN-1
 	jnz	ResetEntry
 
-	cmp.b	2(rVALID),	2(rCANDIDATE)	;size ok, now check 1st three chars
-	mov.b	1(rCANDIDATE),	rTEMP		;basically one round of a bubble sort
-	subc.b	1(rVALID),	rTEMP           ;    move biggest (valid) to the top
-	mov.b	@rCANDIDATE,	rTEMP
-	subc.b	@rVALID,	rTEMP
-	jnc	ResetEntry			;1st 3 chars of candidate less than valid
+	swpb	2(rCANDIDATE)			;Endian adjust
+	swpb	@rCANDIDATE
 
-	xor.w	#0x20,		rCANDIDATE	;candidate is greater, so make it valid
+	cmp.w	2(rVALID),	2(rCANDIDATE)	;size ok, now check 1st four chars
+	mov.w	@rCANDIDATE,	rTEMP
+	subc.w	@rVALID,	rTEMP
+	jnc	ResetEntry			;1st 4 chars of Candidate less than Valid
+
+	xor.w	#0x20,		rCANDIDATE	;Candidate is greater, so make it Valid
 	xor.w	#0x20,		rVALID
 	jmp	ResetEntry
 
@@ -285,11 +298,11 @@ EndOfDir:
 
 	call	#TerminateMulti			;terminate multi-sector read
 
-	cmp.b	#0,		0(rVALID)	;if 1st char of valid still 0,
+	cmp.b	#0,		0(rVALID)	;if 1st char of Valid still 0,
 	jz	ErrorOut			;  no file found of right size
 	mov.w	CLUSTERLO(rVALID),rWORKINGLO	;entry shows cluster where file begins
 	mov.w	#0,		  rWORKINGHI
-	bit.b	#BIT0,		&FAT32				;if FAT32, still non-zero
+	bit.b	#BIT0,		&FAT32		;if FAT32, still non-zero
 	jz	Normalize
 	mov.w	CLUSTERHI(rVALID),rWORKINGHI    ;32-bit value in FAT32
 
@@ -309,7 +322,7 @@ GoMul:
 	mov.b	#USISSEL_3,	&CLKCTL		;shift to faster SPI clock.  Div = 1
 	call	#ReadMulti			;finally - open file contents
 	mov.w	#NEWMAIN,	rFLASHPOINTER	;  and set up to read in & write to flash
-	mov.b	#8,		rXORSUM		;intialize xor checksum
+	mov.b	#8,		rXORSUM		;initialize xor checksum
 	mov.w	#FWKEY, 	&FCTL3		;Unlock flash
 
 EraseSegment:
@@ -322,7 +335,6 @@ EraseSegment:
 WriteByte:
 
 	call	#ReceiveByte			;read in bytes, write to flash
-	xor.b	rIN,		rXORSUM
 	mov.b	rIN,		0(rFLASHPOINTER)
 	inc.w	rFLASHPOINTER
 	cmp.w	#0xFFFE,	rFLASHPOINTER	;stop at 0xFFFE
@@ -336,20 +348,30 @@ Close:
 	mov.w	#MAIN,		&0xFFFE 	;RESET vector points to bootloader
 	mov.w	#FWKEY, 	&FCTL1		;Turn off Write
 	mov.w	#FWKEY+LOCK,	&FCTL3		;Relock flash
-	call	#ReceiveByte			;read last byte from file
-	xor.b	rIN,		rXORSUM		;if XORSUM matches, will be zero
+	call	#ReceiveByte			;read last byte from file = xorsum
 	call	#TerminateMulti 		;end SD command
-	cmp.b	#0,		rXORSUM         ;should be equal
+	cmp.b	#0,		rXORSUM         ;should be zero
 	jnz	ErrorOut
 
-GoodOut:
-
-	bis.b	#CSPIN, 	&CSOUT		;see pdf for LED setup on CSPIN
+ 	bis.b	#LEDPIN,	&LEDDIR		;LED turned on
+ 	bis.b	#LEDPIN,	&LEDOUT
 
 ErrorOut:
 
-	bis.w	#CPUOFF+OSCOFF,	SR		;Shut down processor. remove card,
-						;   then reboot
+	bic.b	#CSPIN,		&CSDIR		;CS back to input, LED output
+
+GoodOut:
+
+	bit.b	#CSPIN, 	&CSIN		;Wait until Sd card removed
+	jz	DecCount			;if card gone, continue countdown
+	mov.w	#0,		rXORSUM		;else reset count
+
+DecCount:
+
+	dec.w	rXORSUM
+	jnz	GoodOut
+	eint
+	mov.w	#0,		&WDTCTL		;no WDPWD - generate PUC - reboot
 
 
 CMD0:	.db	0x40,0,0,0,0,0x95		;intialization commands
@@ -433,36 +455,34 @@ RS2:
 	jnz	RS2
 	call	#GetFE
 
+	mov.w	#RAM,		rENTRYBYTE	;read in middle BATCH bytes
+
 DumpFirst:
-						;dump beginning bytes
-	cmp.w	#0,		&DUMP
-	jz	GetMiddle
+
 	call	#GetByte
 	dec.w	rSECTORBYTE
+	cmp.w	#0,		&DUMP		;still dumping?
+	jz	GetMiddle			; no
 	dec.w	&DUMP
-	jnz	DumpFirst
+	jmp	DumpFirst
 
 GetMiddle:
 
-	mov.w	#RAM,		rENTRYBYTE	;read in middle BATCH bytes
-
-GM1:
-
-	call	#GetByte
-	dec.w	rSECTORBYTE
-	mov.b	rIN,		0(rENTRYBYTE)
+	mov.b	rIN,		0(rENTRYBYTE)	;keep middle BATCH bytes
 	inc.w	rENTRYBYTE
 	dec.b	&BATCH
-	jnz	GM1
+	jnz	DumpFirst
 
 DumpRest:					;dump rest of sector
 
 	call	#GetByte
 	dec.w	rSECTORBYTE
 	jnz	DumpRest
+
+TwoGets:
+
 	call	#GetByte			;CRC
-	call	#GetByte
-	ret
+	jmp	GetByte
 
 GetFE:
 
@@ -543,6 +563,7 @@ InWait:
 ReceiveByte:					;next byte of multi-sector read
 
 	call	#GetByte
+	xor.b	rIN,		rXORSUM		;accumulate xorsum of file contents
 	dec.w	rSECTORBYTE
 	jz	NextSector			;if sector finished, go to next one
 	ret
@@ -550,10 +571,9 @@ ReceiveByte:					;next byte of multi-sector read
 NextSector:
 
 	push.w	rIN				;dump CRC from previous sector
-	call	#GetByte
-	call	#GetByte
+	call	#TwoGets
 	call	#GetFE				;look for FE
-	pop.w	rIN
+	pop.w	rIN				;now ready to receive from next sector
 	ret
 
 Delay:
@@ -567,7 +587,27 @@ Delay1:
 
 .org	NEWMAIN
 
-	bis.w	#CPUOFF+OSCOFF,	SR		;Place holder for application
+	mov.w	#WDTPW+WDTHOLD, &WDTCTL 	;disable Watchdog timer
+	mov.w	#RAMTOP,	SP		;set stack pointer to top of RAM
+
+;Set main clock to 1MHz
+
+	mov.b	&DCO,		&DCOCTL 	;Set clock to calibrated 1MHz values
+	mov.b	&BCS,		&BCSCTL1
+
+	bic.b	#CSPIN,		&CSDIR          ;make sure CS is input
+
+CheckCard:
+
+	bit.b	#CSPIN,	 	&CSIN		;Check for SD card inserted
+	jnz	DownCount			;if card present, continue countdown
+	mov.w	#0,		rXORSUM		;else reset count
+
+DownCount:
+
+	dec.w	rXORSUM
+	jnz	CheckCard
+	mov.w	#0,		&WDTCTL		;generate PUC
 
 
 .org	RESET_VECTOR
